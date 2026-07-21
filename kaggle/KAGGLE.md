@@ -64,6 +64,37 @@ yourself.
 
 Skip this cell entirely for Path B.
 
+## Cell 1.5 — HuggingFace token (optional, but do it)
+
+Without a token you will see:
+
+```
+Warning: You are sending unauthenticated requests to the HF Hub.
+Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+```
+
+Harmless — the Qwen and Mistral repos are public and still download — but
+unauthenticated pulls are rate-limited, and you are fetching several GB inside a
+time-boxed session. Set the token and the download stops being the slow part.
+
+1. Create a token at <https://huggingface.co/settings/tokens> (`read` scope)
+2. Notebook → **Add-ons → Secrets** → add it as `HF_TOKEN`
+3. Load it **before** starting the server:
+
+```python
+from kaggle_secrets import UserSecretsClient
+import os
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```
+
+A token is also what unlocks the **gated** repos (`meta-llama/*`) once you want
+LLaMA-3.2-3B in the pool for the heterogeneous setting — but those additionally
+need the license accepted and manual approval on the model page, so request
+access well before you need it.
+
+Weights are cached in `~/.cache/huggingface` for the life of the session, so
+setting the token after a download has already completed changes nothing.
+
 ## Cell 2 — get the code
 
 ```python
