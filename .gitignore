@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Response cache — large, machine-readable, regenerable. Ship as a Kaggle
+# Dataset rather than committing it.
+data/responses.sqlite
+
+# Benchmark caches
+data/*.jsonl
+
+# Traces are the project's primary artifact and SHOULD be versioned, but as a
+# Kaggle Dataset rather than in git once they exceed a few MB.
+traces/*.jsonl

@@ -1,0 +1,12 @@
+# Anthropic-backed agent pools (the default for both strong and cheap).
+anthropic>=0.117
+
+# Used by the OpenAI-compatible backend (self-hosted vLLM / other providers)
+# and by the HF datasets-server loader.
+requests>=2.28
+numpy>=1.24
+
+# Phase 3 only (stop-head training). Not needed for E1.
+# torch>=2.0
+# scikit-learn>=1.3        # calibration / reliability diagrams
+# sentence-transformers    # frozen encoder for state features
