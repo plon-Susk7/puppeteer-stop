@@ -29,9 +29,10 @@ termination a separately-parameterized, densely-supervised decision.
 python experiments/e0_validate_graders.py    # extraction + grading + dataset loading
 python experiments/e0_validate_readout.py    # answer@t and oracle-gap metrics
 python experiments/e0_smoke_pipeline.py      # full chain against a mock provider
+python experiments/e0_validate_serve_hf.py   # fallback server (stubbed torch, no GPU)
 ```
 
-All three must pass before generating a corpus.
+All four must pass before generating a corpus.
 
 ## Generate a corpus and run E1
 

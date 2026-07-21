@@ -32,16 +32,37 @@ and an HF token, and approval is manual — a bad dependency for a 12-hour sessi
 
 ---
 
-## Cell 1 — install
+## Two serving paths — read this before Cell 1
+
+⚠️ **vLLM is not reliable on T4.** Turing is compute capability **7.5**; vLLM's
+V1 engine defaults to attention kernels requiring **≥ 8.0**, and some recent
+versions crash at load on `sm_75`. Depending on the version you get, it may work
+perfectly or fail immediately.
+
+| | Path A — vLLM | Path B — transformers |
+|---|---|---|
+| Speed | fast (continuous batching) | slower (windowed batching) |
+| Reliability on T4 | version-dependent | works |
+| Install | `pip install vllm` (~5 min) | already on Kaggle |
+| Model | `Qwen2.5-7B-Instruct-AWQ` | `Qwen2.5-3B-Instruct` |
+
+**Try Path A. If the server does not come up within one attempt, switch to
+Path B rather than debugging** — B is in this repo (`kaggle/serve_hf.py`), speaks
+the same OpenAI-compatible API, and every later cell is identical.
+
+---
+
+## Cell 1 — install (Path A only)
 
 ```python
 !pip install -q vllm
-!pip install -q requests
 ```
 
-vLLM pulls its own torch build; if the kernel complains about a torch version
-mismatch, restart the kernel once (Run → Restart) and re-run from Cell 2. Do not
-`pip install torch` yourself — let vLLM pin it.
+vLLM pins its own torch build. If the kernel complains about a torch mismatch,
+restart once (Run → Restart) and resume at Cell 2. Do **not** `pip install torch`
+yourself.
+
+Skip this cell entirely for Path B.
 
 ## Cell 2 — get the code
 
@@ -53,32 +74,60 @@ mismatch, restart the kernel once (Run → Restart) and re-run from Cell 2. Do n
 The repo is public, so no token is needed. To pick up later changes without a
 fresh clone: `!cd /kaggle/working/puppeteer-stop && git pull`.
 
-## Cell 3 — start the vLLM server in the background
+## Cell 3 — start the server in the background
+
+Both paths use the same wait-for-health loop, so run whichever block applies and
+continue to Cell 4 either way.
+
+### Path A — vLLM
 
 ```python
 import os, subprocess, time, requests
 
 MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+LOG   = "/kaggle/working/server.log"
 
-env = dict(os.environ, CUDA_VISIBLE_DEVICES="0")   # one model on GPU 0
+env = dict(
+    os.environ,
+    CUDA_VISIBLE_DEVICES="0",        # one model on GPU 0
+    VLLM_USE_V1="0",                 # V1 engine assumes compute capability >= 8.0
+    VLLM_ATTENTION_BACKEND="XFORMERS",  # FlashAttention 2/3 are unavailable on Turing
+)
 server = subprocess.Popen(
     [
-        "python", "-m", "vllm.entrypoints.openai.api_server",
-        "--model", MODEL,
-        "--dtype", "half",              # T4 has no bfloat16
+        "vllm", "serve", MODEL,
+        "--dtype", "half",               # T4 has no bfloat16
         "--quantization", "awq",
-        "--max-model-len", "8192",      # history grows ~6 steps; 8k is ample
+        "--max-model-len", "8192",       # history grows over ~6 steps; 8k is ample
         "--gpu-memory-utilization", "0.90",
-        "--disable-log-requests",       # 1800 requests would flood the log
+        "--disable-log-requests",        # 1800 requests would flood the log
         "--port", "8000",
     ],
-    env=env,
-    stdout=open("/kaggle/working/vllm.log", "w"),
-    stderr=subprocess.STDOUT,
+    env=env, stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
 )
+```
 
-# First run downloads ~5.5 GB, so allow several minutes.
-for i in range(120):
+### Path B — transformers fallback
+
+```python
+import os, subprocess, time, requests
+
+MODEL = "Qwen/Qwen2.5-3B-Instruct"   # fp16 ~6 GB, comfortable on one T4
+LOG   = "/kaggle/working/server.log"
+
+server = subprocess.Popen(
+    ["python", "kaggle/serve_hf.py",
+     "--model", MODEL, "--port", "8000", "--max-batch", "16", "--dtype", "float16"],
+    env=dict(os.environ, CUDA_VISIBLE_DEVICES="0"),
+    stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
+)
+```
+
+### Then, for either path — wait for health
+
+```python
+# First run downloads several GB, so allow time.
+for i in range(180):
     try:
         if requests.get("http://localhost:8000/health", timeout=2).status_code == 200:
             print(f"server up after ~{i * 5}s"); break
@@ -86,11 +135,11 @@ for i in range(120):
         pass
     if server.poll() is not None:
         print("server died — last 40 log lines:")
-        print("".join(open("/kaggle/working/vllm.log").readlines()[-40:]))
-        raise SystemExit(1)
+        print("".join(open(LOG).readlines()[-40:]))
+        raise SystemExit("server failed to start (see log above)")
     time.sleep(5)
 else:
-    raise SystemExit("server did not become healthy in 10 minutes")
+    raise SystemExit("server did not become healthy in 15 minutes")
 ```
 
 ## Cell 4 — sanity-check the server
@@ -174,9 +223,12 @@ shortcut.
 
 | Symptom | Cause / fix |
 |---|---|
-| `ValueError: Bfloat16 is only supported on GPUs with compute capability of at least 8.0` | T4 is 7.5 — pass `--dtype half` |
-| OOM at startup | Lower `--gpu-memory-utilization` to 0.85, or `--max-model-len` to 4096 |
-| Server dies silently | `!tail -50 /kaggle/working/vllm.log` |
-| Throughput flat as concurrency rises | KV cache is saturated — check the log for preemption; lower `--max-model-len` to fit more sequences |
-| Very slow first request | Model download plus CUDA graph capture; only the first is slow |
+| `Bfloat16 is only supported on GPUs with compute capability of at least 8.0` | T4 is 7.5 — `--dtype half` (Path A) / `--dtype float16` (Path B) |
+| `FA3 is only supported on devices with compute capability >= 8` | vLLM V1 engine — set `VLLM_USE_V1=0` and `VLLM_ATTENTION_BACKEND=XFORMERS` |
+| vLLM crashes detecting `sm_75` / CUTLASS error | Known Turing breakage in some vLLM builds. **Switch to Path B** — don't burn quota bisecting versions |
+| OOM at startup | Lower `--gpu-memory-utilization` to 0.85 or `--max-model-len` to 4096 (Path A); use the 3B model (Path B) |
+| Server dies silently | `!tail -50 /kaggle/working/server.log` |
+| Throughput flat as concurrency rises | Path A: KV cache saturated — check the log for preemption. Path B: raise `--max-batch` to match `--concurrency` |
+| Path B output is garbled or empty | Left-padding or chat template mismatch — confirm Cell 4 returns clean text before generating a corpus |
+| Very slow first request | Model download plus warm-up; only the first is slow |
 | `datasets-server` errors in the loader | Internet is off in notebook settings |
