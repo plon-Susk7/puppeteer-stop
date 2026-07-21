@@ -40,7 +40,10 @@ BATCH_WINDOW_S = 0.02
 
 
 class _Job:
-    __slots__ = ("prompt", "max_tokens", "temperature", "done", "text", "error", "n_prompt")
+    __slots__ = (
+        "prompt", "max_tokens", "temperature", "done",
+        "text", "error", "n_prompt", "n_completion",
+    )
 
     def __init__(self, prompt: str, max_tokens: int, temperature: float) -> None:
         self.prompt = prompt
@@ -50,6 +53,7 @@ class _Job:
         self.text: str = ""
         self.error: str | None = None
         self.n_prompt: int = 0
+        self.n_completion: int = 0
 
 
 class BatchEngine:
@@ -63,14 +67,34 @@ class BatchEngine:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=dtype, device_map="auto"
-        )
+        # `torch_dtype` was renamed to `dtype`; accept whichever this
+        # transformers version wants rather than pinning a version.
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, dtype=dtype, device_map="auto"
+            )
+        except TypeError:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=dtype, device_map="auto"
+            )
         self.model.eval()
         self.max_batch = max_batch
         self.queue: queue.Queue[_Job] = queue.Queue()
+        # HuggingFace "fast" tokenizers are Rust-backed with interior
+        # mutability. Calling one from two threads at once -- especially when a
+        # call mutates padding state, as batch encoding does -- panics with
+        # "RuntimeError: Already borrowed". All tokenizer access goes through
+        # this lock.
+        self.tok_lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
         print(f"ready: {model_id} on {self.model.device}", flush=True)
+
+    def render(self, messages: list[dict]) -> str:
+        """Chat template, under the tokenizer lock (handler threads call this)."""
+        with self.tok_lock:
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
 
     def submit(self, job: _Job) -> None:
         self.queue.put(job)
@@ -108,11 +132,13 @@ class BatchEngine:
         max_new = max(j.max_tokens for j in batch)
         temperature = batch[0].temperature
 
-        enc = self.tokenizer(
-            [j.prompt for j in batch], return_tensors="pt", padding=True
-        ).to(self.model.device)
+        with self.tok_lock:
+            enc = self.tokenizer(
+                [j.prompt for j in batch], return_tensors="pt", padding=True
+            ).to(self.model.device)
 
-        kwargs = {"max_new_tokens": max_new, "pad_token_id": self.tokenizer.pad_token_id}
+        pad_id = self.tokenizer.pad_token_id
+        kwargs = {"max_new_tokens": max_new, "pad_token_id": pad_id}
         if temperature and temperature > 0:
             kwargs.update(do_sample=True, temperature=temperature)
         else:
@@ -120,9 +146,19 @@ class BatchEngine:
 
         out = self.model.generate(**enc, **kwargs)
         prompt_len = enc["input_ids"].shape[1]
-        for job, seq in zip(batch, out):
-            job.text = self.tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
-            job.n_prompt = prompt_len
+
+        with self.tok_lock:
+            for job, seq in zip(batch, out):
+                generated = seq[prompt_len:]
+                job.text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                job.n_prompt = prompt_len
+                # Count real generated tokens here rather than re-tokenizing the
+                # text in the handler thread: it is exact, free, and keeps every
+                # tokenizer call on this one thread.
+                n = len(generated)
+                while n > 0 and int(generated[n - 1]) == pad_id:
+                    n -= 1
+                job.n_completion = n
 
         print(f"batch={len(batch):2d} prompt_len={prompt_len:5d} new<={max_new}", flush=True)
 
@@ -161,9 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": f"bad request: {exc}"})
             return
 
-        prompt = self.engine.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = self.engine.render(messages)
         job = _Job(
             prompt=prompt,
             max_tokens=int(req.get("max_tokens", 700)),
@@ -176,7 +210,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": job.error})
             return
 
-        n_completion = len(self.engine.tokenizer(job.text)["input_ids"])
         self._send(
             200,
             {
@@ -194,8 +227,8 @@ class Handler(BaseHTTPRequestHandler):
                 # reported honestly rather than zero-filled.
                 "usage": {
                     "prompt_tokens": job.n_prompt,
-                    "completion_tokens": n_completion,
-                    "total_tokens": job.n_prompt + n_completion,
+                    "completion_tokens": job.n_completion,
+                    "total_tokens": job.n_prompt + job.n_completion,
                 },
             },
         )

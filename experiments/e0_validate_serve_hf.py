@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import types
 import urllib.request
 from pathlib import Path
@@ -25,7 +26,12 @@ sys.path.insert(0, str(ROOT / "kaggle"))
 
 def install_stubs() -> dict:
     """Minimal fakes for torch / transformers, plus a record of generate() calls."""
-    record = {"batch_sizes": [], "padding_side": None, "left_padded": False}
+    record = {
+        "batch_sizes": [],
+        "padding_side": None,
+        "left_padded": False,
+        "concurrent_use": False,
+    }
 
     torch = types.ModuleType("torch")
     torch.float16 = "float16"
@@ -50,29 +56,56 @@ def install_stubs() -> dict:
             return self
 
     class FakeTokenizer:
+        """Mimics a Rust-backed fast tokenizer, including its thread hostility.
+
+        Real HuggingFace fast tokenizers raise `RuntimeError: Already borrowed`
+        when used from two threads at once. Reproducing that here is the point:
+        an earlier version of the server tokenized in the HTTP handler while the
+        batch worker was tokenizing too, and only blew up under real load.
+        """
+
         def __init__(self):
             self.padding_side = "right"
             self.pad_token = None
             self.eos_token = "<eos>"
             self.pad_token_id = 0
+            self._busy = threading.Lock()
+
+        def _borrow(self):
+            if not self._busy.acquire(blocking=False):
+                record["concurrent_use"] = True
+                raise RuntimeError("Already borrowed")
+            return self._busy
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
-            return "|".join(f"{m['role']}:{m['content']}" for m in messages) + "|assistant:"
+            lock = self._borrow()
+            try:
+                time.sleep(0.002)   # widen the window so races actually surface
+                return "|".join(f"{m['role']}:{m['content']}" for m in messages) + "|assistant:"
+            finally:
+                lock.release()
 
         def __call__(self, text, return_tensors=None, padding=False):
-            texts = [text] if isinstance(text, str) else list(text)
-            if return_tensors is None:
-                return {"input_ids": [1] * max(1, len(texts[0]) // 4)}
-            record["batch_sizes"].append(len(texts))
-            record["padding_side"] = self.padding_side
-            record["left_padded"] = self.padding_side == "left"
-            width = max(len(t) for t in texts)
-            return FakeEncoding(
-                input_ids=_FakeTensor([[0] * width for _ in texts]),
-            )
+            lock = self._borrow()
+            try:
+                texts = [text] if isinstance(text, str) else list(text)
+                if return_tensors is None:
+                    return {"input_ids": [1] * max(1, len(texts[0]) // 4)}
+                record["batch_sizes"].append(len(texts))
+                record["padding_side"] = self.padding_side
+                record["left_padded"] = self.padding_side == "left"
+                time.sleep(0.005)
+                width = max(len(t) for t in texts)
+                return FakeEncoding(input_ids=_FakeTensor([[0] * width for _ in texts]))
+            finally:
+                lock.release()
 
         def decode(self, seq, skip_special_tokens=True):
-            return f"FINAL ANSWER: {int(seq[0])}"
+            lock = self._borrow()
+            try:
+                return f"FINAL ANSWER: {int(seq[0])}"
+            finally:
+                lock.release()
 
     class _FakeTensor(list):
         @property
@@ -81,14 +114,24 @@ def install_stubs() -> dict:
 
     class FakeModel:
         device = "cpu"
+        # How many real tokens each row "generates" before padding. Rows differ
+        # so the trailing-pad trim is actually exercised rather than assumed.
+        REAL = [3, 5]
 
         def eval(self):
             return self
 
-        def generate(self, input_ids=None, max_new_tokens=None, **kw):
-            # One row out per row in, echoing the batch index so the handler's
-            # request/response pairing can be checked.
-            return [[float(i)] * (input_ids.shape[1] + 1) for i in range(len(input_ids))]
+        def generate(self, input_ids=None, max_new_tokens=None, pad_token_id=0, **kw):
+            width = input_ids.shape[1]
+            rows = []
+            for i in range(len(input_ids)):
+                n_real = self.REAL[i % len(self.REAL)]
+                prompt = [pad_token_id] * width
+                # Real token ids deliberately != pad_token_id.
+                gen = [101 + i] * n_real
+                pad = [pad_token_id] * (max_new_tokens - n_real)
+                rows.append(prompt + gen + pad)
+            return rows
 
     transformers = types.ModuleType("transformers")
     transformers.AutoTokenizer = types.SimpleNamespace(
@@ -163,6 +206,14 @@ def main() -> int:
     check("usage keys present",
           sorted(body["usage"]) == ["completion_tokens", "prompt_tokens", "total_tokens"], True)
     check("prompt_tokens non-zero", body["usage"]["prompt_tokens"] > 0, True)
+    # The fake model emits 3 real tokens then pads; anything else means the
+    # trailing-pad trim is wrong and every efficiency number would be inflated.
+    check("completion_tokens excludes padding", body["usage"]["completion_tokens"], 3)
+    check(
+        "total = prompt + completion",
+        body["usage"]["total_tokens"],
+        body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"],
+    )
 
     print("== concurrent requests are batched ==")
     record["batch_sizes"].clear()
@@ -189,6 +240,14 @@ def main() -> int:
 
     check("all 12 responded", len(results), 12)
     check("all well-formed", all(r["choices"][0]["message"]["content"] for r in results), True)
+    # The regression this file exists for: tokenizing from handler threads while
+    # the batch worker tokenizes raises "Already borrowed" under real load.
+    check("tokenizer never used concurrently", record["concurrent_use"], False)
+    check(
+        "completion_tokens reported",
+        all(r["usage"]["completion_tokens"] > 0 for r in results),
+        True,
+    )
     largest = max(record["batch_sizes"]) if record["batch_sizes"] else 0
     batched = largest > 1
     print(f"  [{'ok ' if batched else 'FAIL'}] batched 12 concurrent requests: "
