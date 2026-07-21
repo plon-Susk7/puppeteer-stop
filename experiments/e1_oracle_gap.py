@@ -40,33 +40,44 @@ def trace_path(dataset: str, policy: str, pool: str) -> Path:
 
 
 def preflight(spec) -> None:
-    """Fail fast, and legibly, when a self-hosted server is not up.
+    """Fail fast, and legibly, when a self-hosted backend is not up.
 
     Without this, a closed port produces 1,800 retry-storm failures that all say
     the same unhelpful thing — the single most likely way to waste a session.
+    Every backend is checked: with two GPUs, one server silently failing to
+    start would otherwise halve throughput without any visible error.
     """
-    if spec.api != "openai" or not spec.base_url:
+    if spec.api != "openai":
         return
 
     import requests
 
-    root = spec.base_url.rstrip("/")
-    for path in ("/models", "/../health"):
-        try:
-            url = root + path if path == "/models" else root.rsplit("/v1", 1)[0] + "/health"
-            if requests.get(url, timeout=5).status_code == 200:
-                print(f"server reachable at {root}\n")
-                return
-        except requests.RequestException:
+    unreachable = []
+    for model, base_url in spec.backends:
+        if not base_url:
             continue
+        root = base_url.rstrip("/")
+        ok = False
+        for url in (f"{root}/models", root.rsplit("/v1", 1)[0] + "/health"):
+            try:
+                if requests.get(url, timeout=5).status_code == 200:
+                    ok = True
+                    break
+            except requests.RequestException:
+                continue
+        print(f"  {'up  ' if ok else 'DOWN'}  {root}  ({model})")
+        if not ok:
+            unreachable.append(root)
 
-    raise SystemExit(
-        f"No model server is reachable at {root}.\n\n"
-        "Start one before generating (see kaggle/KAGGLE.md Cell 3):\n"
-        "  Path A (vLLM):         vllm serve <model> --dtype half --port 8000\n"
-        "  Path B (transformers): python kaggle/serve_hf.py --model <model> --port 8000\n\n"
-        "Then re-run this command. Generation is resumable, so nothing is lost."
-    )
+    if unreachable:
+        raise SystemExit(
+            f"\n{len(unreachable)} backend(s) unreachable: {', '.join(unreachable)}\n\n"
+            "Start them before generating (see kaggle/KAGGLE.md Cell 3):\n"
+            "  Path A (vLLM):         vllm serve <model> --dtype half --port 8000\n"
+            "  Path B (transformers): python kaggle/serve_hf.py --model <model> --port 8000\n\n"
+            "Then re-run this command. Generation is resumable, so nothing is lost."
+        )
+    print()
 
 
 def cmd_generate(args: argparse.Namespace) -> int:
@@ -84,8 +95,20 @@ def cmd_generate(args: argparse.Namespace) -> int:
     already = len(writer)
     print(f"corpus: {path}")
     print(f"  dataset={args.dataset}  tasks={len(tasks)}  depth={args.depth}")
-    print(f"  policy={args.policy}  pool={args.pool} ({spec.api}:{spec.model})")
+    print(f"  policy={args.policy}  pool={args.pool}  backends={len(spec.backends)}")
     print(f"  seed={args.seed}  concurrency={args.concurrency}")
+
+    if len(spec.backends) > 1:
+        print(f"  routing={spec.routing}")
+        if spec.routing == "per_agent":
+            # Heterogeneous run: the agent -> model binding is part of the
+            # experimental condition, so record it rather than leaving it
+            # implicit in the traces.
+            from puppeteer_stop.agents import AGENT_NAMES
+
+            for agent, model in sorted(client.assignments(AGENT_NAMES).items()):
+                print(f"    {agent:<10} -> {model}")
+
     print(f"  already complete: {already}")
     print(f"  ~{(len(tasks) - already) * args.depth} model calls remaining\n")
 

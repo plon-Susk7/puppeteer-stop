@@ -27,7 +27,7 @@ import hashlib
 import json
 import os
 import sqlite3
-import threading
+import threading  # noqa: F401  (used by ResponseCache and LLMRouter)
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -207,6 +207,7 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         seed: int | None = None,
+        route_key: str | None = None,  # ignored; kept so a router can substitute
     ) -> Completion:
         temperature = self.temperature if temperature is None else temperature
         max_tokens = self.max_tokens if max_tokens is None else max_tokens
@@ -361,3 +362,74 @@ class LLMClient:
 
 class _RetriableStatus(Exception):
     """HTTP status that warrants a backoff rather than a hard failure."""
+
+
+class LLMRouter:
+    """Spreads requests across several backends. Substitutable for LLMClient.
+
+    Kaggle gives two T4s, and the same mechanism covers both things you'd want
+    to do with them:
+
+      `round_robin` — the same model served on every GPU. Pure throughput:
+                      corpus generation time drops roughly linearly in the
+                      number of backends.
+
+      `per_agent`   — a different model per GPU, with each agent bound to one
+                      of them by a stable hash of its name. This is the paper's
+                      non-Mono setting, where agents are driven by a diverse set
+                      of models.
+
+    `per_agent` binds deterministically rather than randomly on purpose: an
+    agent that answers from a different model on every activation would make the
+    resulting trace uninterpretable, since agent identity and model identity
+    would be confounded within a single episode.
+    """
+
+    def __init__(self, clients: Sequence[LLMClient], strategy: str = "round_robin") -> None:
+        if not clients:
+            raise ValueError("LLMRouter needs at least one client")
+        if strategy not in {"round_robin", "per_agent"}:
+            raise ValueError(
+                f"unknown routing strategy {strategy!r}; "
+                "expected 'round_robin' or 'per_agent'"
+            )
+        self.clients = list(clients)
+        self.strategy = strategy
+        self._next = 0
+        self._lock = threading.Lock()
+
+    @property
+    def model(self) -> str:
+        """Label for logs; per-step models are recorded on each StepRecord."""
+        names = sorted({c.model for c in self.clients})
+        return names[0] if len(names) == 1 else "+".join(names)
+
+    def _pick(self, route_key: str | None) -> LLMClient:
+        if len(self.clients) == 1:
+            return self.clients[0]
+        if self.strategy == "per_agent" and route_key is not None:
+            # sha256 rather than hash(): Python salts str hashing per process,
+            # so hash() would assign agents to models differently on every run.
+            digest = hashlib.sha256(route_key.encode()).digest()
+            return self.clients[digest[0] % len(self.clients)]
+        with self._lock:
+            client = self.clients[self._next % len(self.clients)]
+            self._next += 1
+        return client
+
+    def complete(
+        self,
+        messages: Sequence[dict],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        seed: int | None = None,
+        route_key: str | None = None,
+    ) -> Completion:
+        return self._pick(route_key).complete(
+            messages, temperature=temperature, max_tokens=max_tokens, seed=seed
+        )
+
+    def assignments(self, keys: Sequence[str]) -> dict[str, str]:
+        """Which model each route key resolves to — for logging a run's setup."""
+        return {k: self._pick(k).model for k in keys}

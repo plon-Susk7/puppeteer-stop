@@ -28,7 +28,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .llm import LLMClient, ResponseCache
+from .llm import LLMClient, LLMRouter, ResponseCache
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get("PSTOP_DATA_DIR", ROOT / "data"))
@@ -64,7 +64,7 @@ POOL_NAMES = tuple(POOL_DEFAULTS)
 class PoolSpec:
     """One agent-model backend."""
 
-    name: str            # "strong" | "cheap"
+    name: str            # "local" | "strong" | "cheap"
     model: str
     api: str = "anthropic"
     base_url: str | None = None
@@ -72,6 +72,30 @@ class PoolSpec:
     temperature: float = DEFAULT_TEMPERATURE
     max_tokens: int = DEFAULT_MAX_TOKENS
     disable_thinking: bool = False
+    routing: str = "round_robin"
+
+    @property
+    def models(self) -> list[str]:
+        return [m.strip() for m in self.model.split(",") if m.strip()]
+
+    @property
+    def base_urls(self) -> list[str | None]:
+        if not self.base_url:
+            return [None]
+        return [u.strip() for u in self.base_url.split(",") if u.strip()]
+
+    @property
+    def backends(self) -> list[tuple[str, str | None]]:
+        """(model, base_url) per backend.
+
+        One model with several URLs is replication — the same model served on
+        each GPU, for throughput. Several models is a heterogeneous pool. A
+        shorter list is cycled, so `model=A,B` with a single URL is also valid
+        (two models behind one server).
+        """
+        models, urls = self.models, self.base_urls
+        width = max(len(models), len(urls))
+        return [(models[i % len(models)], urls[i % len(urls)]) for i in range(width)]
 
     @staticmethod
     def from_env(name: str) -> "PoolSpec | None":
@@ -89,6 +113,7 @@ class PoolSpec:
             temperature=float(os.environ.get(f"{prefix}_TEMPERATURE", DEFAULT_TEMPERATURE)),
             max_tokens=int(os.environ.get(f"{prefix}_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
             disable_thinking=os.environ.get(f"{prefix}_DISABLE_THINKING", "") == "1",
+            routing=os.environ.get(f"{prefix}_ROUTING", "round_robin"),
         )
 
 
@@ -99,18 +124,31 @@ class RunConfig:
     seed: int = 0
     cache_path: Path = field(default_factory=lambda: CACHE_PATH)
 
-    def client(self) -> LLMClient:
-        return LLMClient(
-            model=self.pool.model,
-            api=self.pool.api,
-            base_url=self.pool.base_url,
-            api_key=self.pool.api_key,
-            cache=ResponseCache(self.cache_path),
-            temperature=self.pool.temperature,
-            max_tokens=self.pool.max_tokens,
-            seed=self.seed,
-            disable_thinking=self.pool.disable_thinking,
-        )
+    def client(self) -> LLMClient | LLMRouter:
+        """One client per backend, behind a router when there is more than one.
+
+        The cache is shared across backends by design: its key includes the
+        model, so replicas of the same model hit the same entries and a rerun
+        after a crash costs nothing regardless of which GPU served it first.
+        """
+        cache = ResponseCache(self.cache_path)
+        clients = [
+            LLMClient(
+                model=model,
+                api=self.pool.api,
+                base_url=base_url,
+                api_key=self.pool.api_key,
+                cache=cache,
+                temperature=self.pool.temperature,
+                max_tokens=self.pool.max_tokens,
+                seed=self.seed,
+                disable_thinking=self.pool.disable_thinking,
+            )
+            for model, base_url in self.pool.backends
+        ]
+        if len(clients) == 1:
+            return clients[0]
+        return LLMRouter(clients, strategy=self.pool.routing)
 
 
 def resolve_pool(name: str) -> PoolSpec:

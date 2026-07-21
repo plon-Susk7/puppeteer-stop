@@ -239,16 +239,96 @@ project's primary artifact — losing it means paying for it again.
 
 ---
 
-## Heterogeneous pool (later)
+## Using both T4s
 
-Kaggle gives **two** T4s, so a genuinely heterogeneous pool is one extra server:
-Qwen2.5-7B-AWQ on GPU 0, Mistral-7B-Instruct on GPU 1 (`CUDA_VISIBLE_DEVICES="1"`,
-`--port 8001`). That reproduces the paper's non-Mono setting, where agents are
-driven by a diverse set of models.
+Kaggle gives two GPUs, and there are two different things worth doing with them.
+Both work the same way: start one server per GPU, then give the pool a
+comma-separated list of URLs.
 
-Until then you are running the paper's **Puppeteer-Mono** condition — one model
-driving every agent — which is a published configuration in Table 1, not a
-shortcut.
+### A. Replication — same model twice, for speed
+
+Roughly halves corpus generation time. Nothing about the experiment changes.
+
+```python
+import os, subprocess, time, requests
+
+MODEL = "Qwen/Qwen2.5-3B-Instruct"
+procs = []
+for gpu, port in [(0, 8000), (1, 8001)]:
+    procs.append(subprocess.Popen(
+        ["python", "/kaggle/working/puppeteer-stop/kaggle/serve_hf.py",
+         "--model", MODEL, "--port", str(port), "--max-batch", "16"],
+        env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu)),
+        stdout=open(f"/kaggle/working/server{port}.log", "w"),
+        stderr=subprocess.STDOUT,
+    ))
+
+for port in (8000, 8001):
+    for _ in range(180):
+        try:
+            if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
+                print(f"port {port} up"); break
+        except Exception: pass
+        time.sleep(5)
+    else:
+        raise SystemExit(f"port {port} never came up")
+
+os.environ["PSTOP_LOCAL_MODEL"]    = MODEL
+os.environ["PSTOP_LOCAL_BASE_URL"] = "http://localhost:8000/v1,http://localhost:8001/v1"
+os.environ["PSTOP_LOCAL_ROUTING"] = "round_robin"
+```
+
+Then raise concurrency, since there are now two servers to keep busy:
+
+```python
+!python experiments/e1_oracle_gap.py generate \
+    --dataset gsm-hard --limit 300 --pool local --concurrency 48
+```
+
+### B. Heterogeneous pool — different model per GPU
+
+This is the paper's **non-Mono** setting, where agents are driven by a diverse
+set of models. It is an experimental condition, not an optimization.
+
+```python
+os.environ["PSTOP_LOCAL_MODEL"] = (
+    "Qwen/Qwen2.5-3B-Instruct,mistralai/Mistral-7B-Instruct-v0.3"
+)
+os.environ["PSTOP_LOCAL_BASE_URL"] = "http://localhost:8000/v1,http://localhost:8001/v1"
+os.environ["PSTOP_LOCAL_ROUTING"] = "per_agent"
+```
+
+(Serve Qwen on GPU 0 and Mistral on GPU 1 — same loop as above with a different
+model per port. Mistral-7B in fp16 is ~14 GB and tight on a T4; prefer vLLM with
+an AWQ build, or a smaller second model.)
+
+`per_agent` binds each agent to **one** model by a stable hash of its name, so
+`critique` is always answered by the same model within and across runs. That is
+deliberate: an agent whose backing model changed per activation would confound
+agent identity with model identity inside a single episode. The binding is
+printed at the start of the run and each step's model is recorded in the trace.
+
+`round_robin` would be wrong here — it would scatter agents across models
+randomly and make the traces uninterpretable.
+
+### Which am I running?
+
+With one model and one URL you are running the paper's **Puppeteer-Mono**
+condition — one model driving every agent. That is a published row in Table 1,
+not a shortcut. Replication (A) is still Mono. Only (B) is the multi-model
+setting.
+
+### Bigger models via tensor parallelism
+
+To run a model that does not fit on one T4 (e.g. `Qwen2.5-14B-Instruct-AWQ`),
+shard it across both GPUs instead of replicating — vLLM only:
+
+```
+vllm serve Qwen/Qwen2.5-14B-Instruct-AWQ --tensor-parallel-size 2 --dtype half --quantization awq
+```
+
+This gives one bigger model rather than two servers, so throughput does not
+improve — spend the second GPU this way only if capability is the bottleneck.
 
 ## Troubleshooting
 

@@ -97,7 +97,9 @@ def run_episode(
     for step in range(depth):
         agent = select(step, history, rng)
         messages = build_messages(agent, question, history)
-        completion = client.complete(messages, seed=seed)
+        # route_key lets a multi-backend router bind each agent to a specific
+        # model; a single client ignores it.
+        completion = client.complete(messages, seed=seed, route_key=agent.name)
 
         answer = extract_answer(completion.text, task.kind)
         parsed.append(answer)
