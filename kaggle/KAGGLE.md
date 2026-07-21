@@ -46,11 +46,12 @@ mismatch, restart the kernel once (Run → Restart) and re-run from Cell 2. Do n
 ## Cell 2 — get the code
 
 ```python
-!git clone https://github.com/<you>/puppeteer-stop.git /kaggle/working/puppeteer-stop
+!git clone https://github.com/plon-Susk7/puppeteer-stop.git /kaggle/working/puppeteer-stop
 %cd /kaggle/working/puppeteer-stop
 ```
 
-(Or add the repo as a Kaggle Dataset and copy it into `/kaggle/working`.)
+The repo is public, so no token is needed. To pick up later changes without a
+fresh clone: `!cd /kaggle/working/puppeteer-stop && git pull`.
 
 ## Cell 3 — start the vLLM server in the background
 
