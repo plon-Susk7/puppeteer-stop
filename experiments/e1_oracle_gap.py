@@ -39,6 +39,36 @@ def trace_path(dataset: str, policy: str, pool: str) -> Path:
     return Path(TRACE_DIR) / f"{dataset}__{policy}__{pool}.jsonl"
 
 
+def preflight(spec) -> None:
+    """Fail fast, and legibly, when a self-hosted server is not up.
+
+    Without this, a closed port produces 1,800 retry-storm failures that all say
+    the same unhelpful thing — the single most likely way to waste a session.
+    """
+    if spec.api != "openai" or not spec.base_url:
+        return
+
+    import requests
+
+    root = spec.base_url.rstrip("/")
+    for path in ("/models", "/../health"):
+        try:
+            url = root + path if path == "/models" else root.rsplit("/v1", 1)[0] + "/health"
+            if requests.get(url, timeout=5).status_code == 200:
+                print(f"server reachable at {root}\n")
+                return
+        except requests.RequestException:
+            continue
+
+    raise SystemExit(
+        f"No model server is reachable at {root}.\n\n"
+        "Start one before generating (see kaggle/KAGGLE.md Cell 3):\n"
+        "  Path A (vLLM):         vllm serve <model> --dtype half --port 8000\n"
+        "  Path B (transformers): python kaggle/serve_hf.py --model <model> --port 8000\n\n"
+        "Then re-run this command. Generation is resumable, so nothing is lost."
+    )
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     tasks = LOADERS[args.dataset](limit=args.limit)
     if not tasks:
@@ -46,6 +76,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
         return 1
 
     spec = resolve_pool(args.pool)
+    preflight(spec)
     client = RunConfig(pool=spec, depth=args.depth, seed=args.seed).client()
     path = trace_path(args.dataset, args.policy, args.pool)
     writer = TraceWriter(path)

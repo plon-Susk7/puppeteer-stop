@@ -296,6 +296,16 @@ class LLMClient:
         for attempt in range(MAX_RETRIES):
             try:
                 return self._request(messages, temperature, max_tokens, seed)
+            except requests.ConnectionError as exc:
+                # Nothing is listening. Retrying cannot help, and with high
+                # concurrency a retry storm buries the real cause under a wall
+                # of identical failures.
+                raise RuntimeError(
+                    f"cannot reach the model server at {self.base_url}.\n"
+                    f"  Is it running? Start it first (see kaggle/KAGGLE.md Cell 3),\n"
+                    f"  then re-run this command — completed episodes are skipped.\n"
+                    f"  underlying error: {exc}"
+                ) from exc
             except (requests.RequestException, _RetriableStatus) as exc:
                 last_error = exc
                 if attempt == MAX_RETRIES - 1:
@@ -305,7 +315,8 @@ class LLMClient:
                 # 429 would cost hours of regeneration.
                 time.sleep(min(2**attempt, 30))
         raise RuntimeError(
-            f"{self.model}: request failed after {MAX_RETRIES} attempts"
+            f"{self.model}: request failed after {MAX_RETRIES} attempts — "
+            f"last error: {type(last_error).__name__}: {last_error}"
         ) from last_error
 
     def _request(
