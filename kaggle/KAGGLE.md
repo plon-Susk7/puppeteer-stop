@@ -339,6 +339,8 @@ improve — spend the second GPU this way only if capability is the bottleneck.
 | vLLM crashes detecting `sm_75` / CUTLASS error | Known Turing breakage in some vLLM builds. **Switch to Path B** — don't burn quota bisecting versions |
 | OOM at startup | Lower `--gpu-memory-utilization` to 0.85 or `--max-model-len` to 4096 (Path A); use the 3B model (Path B) |
 | Server dies silently | `!tail -50 /kaggle/working/server.log` |
+| Flood of `BrokenPipeError` in the server log | The client hung up before generation finished — a batch is taking longer than the client timeout. The log now prints `took=NNNs` per batch: if that approaches `PSTOP_LOCAL_TIMEOUT` (default 900s), lower `PSTOP_LOCAL_MAX_TOKENS` (biggest lever), lower `--max-batch`, or raise the timeout |
+| Batches take minutes | Expected on a T4 as history grows — every request in a batch waits for the slowest. `max_tokens` sets the floor on batch time; 512 is already generous for these agents |
 | Throughput flat as concurrency rises | Path A: KV cache saturated — check the log for preemption. Path B: raise `--max-batch` to match `--concurrency` |
 | Path B output is garbled or empty | Left-padding or chat template mismatch — confirm Cell 4 returns clean text before generating a corpus |
 | Very slow first request | Model download plus warm-up; only the first is slow |

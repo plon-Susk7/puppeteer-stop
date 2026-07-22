@@ -78,6 +78,11 @@ class BatchEngine:
                 model_id, torch_dtype=dtype, device_map="auto"
             )
         self.model.eval()
+        # The checkpoint ships sampling defaults; with do_sample=False they are
+        # unused and transformers warns about them on every call.
+        for attr in ("temperature", "top_p", "top_k"):
+            if hasattr(self.model.generation_config, attr):
+                setattr(self.model.generation_config, attr, None)
         self.max_batch = max_batch
         self.queue: queue.Queue[_Job] = queue.Queue()
         # HuggingFace "fast" tokenizers are Rust-backed with interior
@@ -144,7 +149,9 @@ class BatchEngine:
         else:
             kwargs.update(do_sample=False)
 
+        started = time.time()
         out = self.model.generate(**enc, **kwargs)
+        elapsed = time.time() - started
         prompt_len = enc["input_ids"].shape[1]
 
         with self.tok_lock:
@@ -160,7 +167,20 @@ class BatchEngine:
                     n -= 1
                 job.n_completion = n
 
-        print(f"batch={len(batch):2d} prompt_len={prompt_len:5d} new<={max_new}", flush=True)
+        # Timing is the number that matters here: if a batch takes longer than
+        # the client's timeout, every request in it fails with a broken pipe.
+        gen = max(j.n_completion for j in batch)
+        print(
+            f"batch={len(batch):2d} prompt_len={prompt_len:5d} "
+            f"new<={max_new} generated<={gen:4d} took={elapsed:6.1f}s",
+            flush=True,
+        )
+        if elapsed > 120:
+            print(
+                f"  slow batch ({elapsed:.0f}s) — if the client times out, lower "
+                f"max_tokens or --max-batch",
+                flush=True,
+            )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -172,11 +192,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client gave up before we finished generating. One line is
+            # enough — the default handler prints a full traceback per request,
+            # which under load buries every other message in the log.
+            print(
+                "client disconnected before the response was sent "
+                "(raise the client timeout, or lower --max-batch / max_tokens)",
+                flush=True,
+            )
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.rstrip("/") in ("/health", "/v1/models"):

@@ -112,11 +112,20 @@ def install_stubs() -> dict:
         def shape(self):
             return (len(self), len(self[0]) if self else 0)
 
+    class FakeGenerationConfig:
+        def __init__(self):
+            self.temperature = 0.7
+            self.top_p = 0.8
+            self.top_k = 20
+
     class FakeModel:
         device = "cpu"
         # How many real tokens each row "generates" before padding. Rows differ
         # so the trailing-pad trim is actually exercised rather than assumed.
         REAL = [3, 5]
+
+        def __init__(self):
+            self.generation_config = FakeGenerationConfig()
 
         def eval(self):
             return self
@@ -140,6 +149,7 @@ def install_stubs() -> dict:
     transformers.AutoModelForCausalLM = types.SimpleNamespace(
         from_pretrained=lambda *_a, **_k: FakeModel()
     )
+    record["model_factory"] = FakeModel
     sys.modules["transformers"] = transformers
     return record
 
@@ -178,6 +188,14 @@ def main() -> int:
     # produces garbage with right padding, so this is load-bearing.
     check("padding_side is left", serve_hf.Handler.engine.tokenizer.padding_side, "left")
     check("pad_token backfilled from eos", serve_hf.Handler.engine.tokenizer.pad_token, "<eos>")
+
+    print("== sampling defaults cleared ==")
+    # Left set, transformers warns on every greedy call; harmless but it makes
+    # a 1800-request log unreadable.
+    gc = serve_hf.Handler.engine.model.generation_config
+    check("temperature cleared", gc.temperature, None)
+    check("top_p cleared", gc.top_p, None)
+    check("top_k cleared", gc.top_k, None)
 
     print("== health ==")
     with urllib.request.urlopen(f"{base}/health", timeout=10) as r:

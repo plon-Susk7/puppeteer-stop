@@ -34,7 +34,12 @@ from typing import Any, Sequence
 
 import requests
 
-DEFAULT_TIMEOUT = 180
+# A self-hosted server batches many requests into one generate() call, so a
+# single response can legitimately take many minutes: every request in the batch
+# waits for the slowest. Too low a timeout makes the client hang up mid-batch,
+# which the server then reports as a flood of BrokenPipeError. Hosted APIs
+# respond far faster, but a generous ceiling costs nothing when nothing hangs.
+DEFAULT_TIMEOUT = 900
 MAX_RETRIES = 5
 
 
@@ -166,9 +171,11 @@ class LLMClient:
         max_tokens: int = 1024,
         seed: int | None = 0,
         disable_thinking: bool = False,
+        timeout: int = DEFAULT_TIMEOUT,
     ) -> None:
         if api not in {"openai", "anthropic"}:
             raise ValueError(f"unknown api {api!r}; expected 'openai' or 'anthropic'")
+        self.timeout = timeout
         self.model = model
         self.api = api
         self.base_url = base_url.rstrip("/") if base_url else None
@@ -342,7 +349,7 @@ class LLMClient:
         if seed is not None:
             body["seed"] = seed
 
-        resp = self._session.post(url, headers=headers, json=body, timeout=DEFAULT_TIMEOUT)
+        resp = self._session.post(url, headers=headers, json=body, timeout=self.timeout)
         if resp.status_code in (408, 409, 429) or resp.status_code >= 500:
             raise _RetriableStatus(f"HTTP {resp.status_code}: {resp.text[:300]}")
         if resp.status_code >= 400:

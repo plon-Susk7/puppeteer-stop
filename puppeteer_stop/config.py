@@ -40,7 +40,16 @@ CACHE_PATH = Path(os.environ.get("PSTOP_CACHE", DATA_DIR / "responses.sqlite"))
 DEPTH = 6
 
 DEFAULT_TEMPERATURE = 0.0
-DEFAULT_MAX_TOKENS = 700
+
+# The paper's agents emit a short REASONING RESULT plus a FINAL ANSWER, so this
+# is already generous. It matters more than it looks on a self-hosted server:
+# a batch generates until the longest request finishes, so max_tokens sets the
+# floor on how long every batch takes.
+DEFAULT_MAX_TOKENS = 512
+
+# Seconds. Generous because one self-hosted batch can take minutes; too low and
+# the client hangs up mid-generation and the whole batch fails.
+DEFAULT_TIMEOUT = 900
 
 
 # Pool presets. `local` is the open-source path: a vLLM server serving one of
@@ -73,6 +82,7 @@ class PoolSpec:
     max_tokens: int = DEFAULT_MAX_TOKENS
     disable_thinking: bool = False
     routing: str = "round_robin"
+    timeout: int = DEFAULT_TIMEOUT
 
     @property
     def models(self) -> list[str]:
@@ -114,6 +124,7 @@ class PoolSpec:
             max_tokens=int(os.environ.get(f"{prefix}_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
             disable_thinking=os.environ.get(f"{prefix}_DISABLE_THINKING", "") == "1",
             routing=os.environ.get(f"{prefix}_ROUTING", "round_robin"),
+            timeout=int(os.environ.get(f"{prefix}_TIMEOUT", DEFAULT_TIMEOUT)),
         )
 
 
@@ -143,6 +154,7 @@ class RunConfig:
                 max_tokens=self.pool.max_tokens,
                 seed=self.seed,
                 disable_thinking=self.pool.disable_thinking,
+                timeout=self.pool.timeout,
             )
             for model, base_url in self.pool.backends
         ]
